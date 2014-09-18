@@ -13,31 +13,36 @@
 
 namespace Storify\Main;
 
+use Guzzle;
+use Monolog\Logger;
+use Monolog\Handler\StreamHandler;
+
+
 class Storify {
 
-  public $storifyUrl = 'http://storify.com';
-  public $createUrl = 'http://storify.com/create';
+  public $storifyUrl = 'https://storify.com';
+  public $createUrl = 'https://storify.com/create';
 
   public $callbackQueryArg = 'callback';
   public $permalinkQueryArg = 'storyPermalink';
 
   // Regex to parse Storify URLs.
-  public $storifyUrlRegex = '#^http://(www\.)?storify.com/([A-Za-z0-9_]+)/([A-Z0-9-]+)(/)?$#i';
+  public $storifyUrlRegex = '#^https://(www\.)?storify.com/([A-Za-z0-9_]+)/([A-Z0-9-]+)(/)?$#i';
 
   // Embed URL, %1$s is username, %2$s is story slug.
-  public $storifyEmbedUrl = 'http://storify.com/%1$s/%2$s.js?header=false&sharing=false&border=false';
+  public $storifyEmbedUrl = 'https://storify.com/%1$s/%2$s.js?header=false&sharing=false&border=false';
 
   // Edit story URL, %1$s is username, %2$s is story slug.
-  public $storifyEditUrl = 'http://storify.com/%1$s/%2$s/edit';
+  public $storifyEditUrl = 'https://storify.com/%1$s/%2$s/edit';
 
   // Story URL, %1$s is username, %2$s is story slug.
-  public $storifyStoryUrl = 'http://storify.com/%1$s/%2$s';
+  public $storifyStoryUrl = 'https://storify.com/%1$s/%2$s';
 
   // URL to story's json data, %1$s is username, %2$s is story slug.
-  public $storifyJsonUrl = 'http://api.storify.com/v1/stories/%1$s/%2$s';
+  public $storifyJsonUrl = 'https://api.storify.com/v1/stories/%1$s/%2$s';
 
   // URL to HTML version of the story.
-  public $storifyMinimalUrl = 'http://storify.com/%1$s/%2$s/minimal';
+  public $storifyMinimalUrl = 'https://storify.com/%1$s/%2$s/minimal';
 
   // What elements to retrieve when getting story metadata.
   public $storyMetadata = array('title', 'description', 'status', 'thumbnail', 'shortlink');
@@ -46,6 +51,10 @@ class Storify {
   private $slug = NULL;
   private $isValidated = FALSE;
 
+  private $logger;
+  private $logfile;
+  private $logger_level;
+
   static $instance;
 
   /**
@@ -53,6 +62,8 @@ class Storify {
    */
   function __construct($argument = NULL) {
     self::$instance = &$this;
+
+    $this->setLogConfig(LOGGER::DEBUG, 'php://stderr');
 
     if ($argument != NULL) {
       $this->setStory($argument);
@@ -106,7 +117,7 @@ class Storify {
    */
   function isValid($user = NULL, $slug = NULL) {
     if ($this->isValidated) {
-      return TRUE;
+//      return TRUE;
     }
 
     $user = (empty($user)) ? $this->user : $user;
@@ -122,15 +133,13 @@ class Storify {
       return FALSE;
     }
 
-    $result = json_decode($this->query(sprintf($this->storifyJsonUrl, $user, $slug)));
-
-    if (!$this->isRequestOk($result)) {
+    if ($result = $this->query(sprintf($this->storifyJsonUrl, $user, $slug))) {
+      $this->isValidated = TRUE;
+      return TRUE;
+    } else {
       $this->isValidated = FALSE;
       return FALSE;
     }
-
-    $this->isValidated = TRUE;
-    return TRUE;
   }
 
   /**
@@ -260,32 +269,38 @@ class Storify {
    * @return string
    *   The result.
    */
-  function query($query) {
-    $c = curl_init();
-    curl_setopt($c, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($c, CURLOPT_URL, $query);
-    $contents = curl_exec($c);
-    curl_close($c);
+  public function query($url) {
 
-    return $this->cache($contents, $query);
-  }
+    $client = new Guzzle\Service\Client($url, array(
+      'ssl.certificate_authority' => FALSE,
+    ));
 
-  /**
-   * Check if the object from the request has been
-   * correctly fetched.
-   *
-   * @param object $object
-   *   The request object.
-   *
-   * @return bool
-   *   True if the request is successful, false if not.
-   */
-  function isRequestOk($object) {
-    if (isset($object->code) && $object->code == 200) {
-      return TRUE;
+    $request = $client->get($url);
+    $this->logger->AddInfo("Request " . $request->getUrl());
+
+    try {
+      $response = $request->send();
+      $output = $response->getBody(TRUE);
+      $this->logger->AddDebug("Response: ". $output);
+    } catch (Guzzle\Http\Exception\BadResponseException $e) {
+      $this->logger->addAlert("Something is wrong.");
+      return FALSE;
     }
 
-    return FALSE;
+    if (!is_object($request)) {
+      $this->logger->addAlert("Something is wrong.");
+      return FALSE;
+    }
+
+    /*
+    if (!$response->getHeader('Content-Type')->hasValue('application/json;charset=UTF-8')) {
+      $this->logger->addAlert("The Content-Type header is wrong.");
+      $this->logger->addAlert($output);
+      return FALSE;
+    }
+    */
+
+    return $output;
   }
 
   /**
@@ -303,4 +318,61 @@ class Storify {
   function cache($data, $query) {
     return $data;
   }
+
+  /**
+   * @param $file
+   * @return bool
+   */
+  public function setLogFile($file) {
+    if (!is_writable($file) && $file != 'php://stderr') {
+      $file = sys_get_temp_dir() . '/Storify.log';
+    }
+
+    $this->logfile = $file;
+    return TRUE;
+  }
+
+  /**
+   * Set logger level.
+   *  DEBUG => 100
+   *  INFO => 200
+   *  WARNING => 300
+   *  ERROR => 400
+   *  CRITICAL => 500
+   *  ALERT => 550
+   *
+   * @param int $level Logger level.
+   * @param string $file Optional file.
+   */
+  public function setLogConfig($level, $file = NULL) {
+    $levels = array(
+      LOGGER::DEBUG,
+      LOGGER::INFO,
+      LOGGER::WARNING,
+      LOGGER::ERROR,
+      LOGGER::CRITICAL,
+      LOGGER::ALERT
+    );
+
+    $this->setLogFile($file);
+
+    if (!in_array($level, $levels)) {
+      $level = Logger::ALERT;
+    }
+
+    $streamhandler = new StreamHandler($this->logfile, $level);
+
+    if (isset($this->logger_level)) {
+      $this->logger->popHandler();
+    } else {
+      $this->logger = new Logger('Storify');
+    }
+
+    $this->logger->pushHandler($streamhandler);
+    $this->logger_level = $level;
+    $this->logger->AddInfo("Setting logfile to: " . $this->logfile);
+    $this->logger->AddInfo("Setting log level to: " . $this->logger_level . "(".LOGGER::getLevelName($this->logger_level).")");
+  }
+
+
 }
